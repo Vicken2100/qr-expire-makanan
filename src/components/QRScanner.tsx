@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Html5Qrcode, Html5QrcodeSupportedFormats } from 'html5-qrcode';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import jsQR from 'jsqr';
 import {
   Camera,
   CameraOff,
@@ -20,9 +20,9 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
-  Layers,
-  Calendar,
-  Eye,
+  RefreshCw,
+  HelpCircle,
+  Zap,
 } from 'lucide-react';
 import { Item } from '../types';
 import {
@@ -50,7 +50,8 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   onItemUpdated,
   onNavigateToGenerator,
 }) => {
-  const [isScanning, setIsScanning] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [isLoadingCamera, setIsLoadingCamera] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [scannedItem, setScannedItem] = useState<Partial<Item> | null>(null);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
@@ -63,165 +64,282 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const [currentStock, setCurrentStock] = useState<number>(0);
   const [isUpdatingStock, setIsUpdatingStock] = useState(false);
   const [stockFeedback, setStockFeedback] = useState<string | null>(null);
-  const [scanSavedFeedback, setScanSavedFeedback] = useState(false);
 
-  const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
-  const isProcessingScan = useRef<boolean>(false);
-  const readerElementId = 'qr-camera-reader';
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animationFrameId = useRef<number | null>(null);
+  const isScanningActive = useRef<boolean>(true);
 
-  // Start Camera
-  const startCamera = async () => {
-    setCameraError(null);
-    try {
-      if (!html5QrCodeRef.current) {
-        html5QrCodeRef.current = new Html5Qrcode(readerElementId, {
-          formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
-          verbose: false,
+  // Stop camera media stream
+  const stopStream = useCallback(() => {
+    if (animationFrameId.current) {
+      cancelAnimationFrame(animationFrameId.current);
+      animationFrameId.current = null;
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => {
+        track.stop();
+      });
+      streamRef.current = null;
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+
+    setIsStreaming(false);
+    setTorchOn(false);
+  }, []);
+
+  // Handle successful QR detection
+  const handleScanSuccess = useCallback(
+    async (text: string) => {
+      if (!isScanningActive.current) return;
+      isScanningActive.current = false; // Lock until user resumes or actions
+
+      // 1. Parse item data from QR
+      const parsed = parseQRPayload(text);
+
+      // 2. Check if item exists in Firestore database
+      let matchedItem: Partial<Item> = parsed || {
+        id: `scanned_${Date.now()}`,
+        name: 'Barang Terpindai',
+        mfgDate: getTodayDateString(),
+        expDate: getTodayDateString(),
+        quantity: 1,
+      };
+
+      if (parsed?.id) {
+        const foundInDb = existingItems.find((it) => it.id === parsed.id);
+        if (foundInDb) {
+          matchedItem = { ...foundInDb, ...parsed };
+        }
+      }
+
+      setScannedItem(matchedItem);
+      const stock = typeof matchedItem.quantity === 'number' ? matchedItem.quantity : 1;
+      setCurrentStock(stock);
+
+      // 3. Calculate status according to prompt requirements
+      const calc = calculateExpiryStatus(
+        matchedItem.mfgDate || getTodayDateString(),
+        matchedItem.expDate || getTodayDateString()
+      );
+
+      // 4. Audio & Haptics Feedback
+      if (soundEnabled) {
+        playStatusAudio(calc.status);
+      }
+      triggerHaptic(calc.status);
+
+      // Confetti if green
+      if (calc.status === 'green') {
+        confetti({
+          particleCount: 25,
+          spread: 50,
+          origin: { y: 0.6 },
         });
       }
 
-      const qrCodeScanner = html5QrCodeRef.current;
+      // 5. Automatically record scan event in Firestore
+      try {
+        await recordScan(matchedItem, calc.status, calc.daysRemaining);
+      } catch (e) {
+        console.warn('Could not record scan log:', e);
+      }
+    },
+    [existingItems, soundEnabled]
+  );
 
-      if (qrCodeScanner.isScanning) {
-        await qrCodeScanner.stop();
+  // Continuous frame scanner loop using BarcodeDetector or jsQR
+  const scanLoop = useCallback(() => {
+    if (!videoRef.current || !canvasRef.current || !isScanningActive.current) {
+      animationFrameId.current = requestAnimationFrame(scanLoop);
+      return;
+    }
+
+    const video = videoRef.current;
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      if (ctx) {
+        // Match canvas dimensions to video
+        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+          canvas.width = video.videoWidth || 640;
+          canvas.height = video.videoHeight || 480;
+        }
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // Check if native BarcodeDetector API exists (super fast on modern Android Chrome / iOS)
+        if ('BarcodeDetector' in window) {
+          try {
+            // @ts-ignore
+            const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+            detector
+              .detect(video)
+              .then((barcodes: Array<{ rawValue: string }>) => {
+                if (barcodes && barcodes.length > 0 && isScanningActive.current) {
+                  handleScanSuccess(barcodes[0].rawValue);
+                  return;
+                }
+              })
+              .catch(() => {
+                // Fallback to jsQR
+              });
+          } catch {
+            // Fallback to jsQR
+          }
+        }
+
+        // Standard jsQR fallback (100% cross-platform compatibility)
+        if (isScanningActive.current) {
+          try {
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: 'dontInvert',
+            });
+
+            if (code && code.data && code.data.trim() && isScanningActive.current) {
+              handleScanSuccess(code.data);
+            }
+          } catch (e) {
+            // ignore scan frame exception
+          }
+        }
+      }
+    }
+
+    animationFrameId.current = requestAnimationFrame(scanLoop);
+  }, [handleScanSuccess]);
+
+  // Robust Camera Starter with automatic fallback constraints
+  const startCamera = useCallback(async () => {
+    setIsLoadingCamera(true);
+    setCameraError(null);
+    stopStream();
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraError(
+        'Peramban ini tidak mendukung akses kamera secara langsung (MediaDevices API tidak tersedia). Silakan gunakan tombol "Unggah Foto QR" dari galeri HP atau buka aplikasi via browser modern seperti Chrome/Safari.'
+      );
+      setIsLoadingCamera(false);
+      return;
+    }
+
+    let stream: MediaStream | null = null;
+
+    // Strategy 1: Ideal facingMode for mobile rear camera
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: facingMode === 'environment' ? { ideal: 'environment' } : 'user',
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+    } catch (err1) {
+      console.warn('Strategy 1 camera request failed, trying simple video constraint...', err1);
+      // Strategy 2: Simple video constraint (works on laptops & stubborn smartphone webcams)
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      } catch (err2: unknown) {
+        console.error('All camera requests failed:', err2);
+        const errMsg = err2 instanceof Error ? err2.message : String(err2);
+
+        if (
+          errMsg.includes('Permission') ||
+          errMsg.includes('NotAllowedError') ||
+          errMsg.includes('denied')
+        ) {
+          setCameraError(
+            'Izin akses kamera diblokir oleh browser. Silakan ketuk ikon gembok / perizinan situs di bilah alamat browser HP Anda, aktifkan izin Kamera, lalu tekan "Coba Lagi". Anda juga dapat menggunakan tombol "Unggah Foto QR" di bawah.'
+          );
+        } else if (errMsg.includes('NotFound') || errMsg.includes('DevicesNotFoundError')) {
+          setCameraError('Kamera tidak ditemukan pada perangkat Anda.');
+        } else {
+          setCameraError(
+            `Kamera belum dapat dibuka (${errMsg}). Silakan coba tekan "Coba Lagi" atau gunakan opsi "Unggah Foto QR" dari galeri.`
+          );
+        }
+        setIsLoadingCamera(false);
+        return;
+      }
+    }
+
+    if (stream) {
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        try {
+          await videoRef.current.play();
+        } catch (playErr) {
+          console.warn('Video play interrupted:', playErr);
+        }
       }
 
-      await qrCodeScanner.start(
-        { facingMode: { ideal: facingMode } },
-        {
-          fps: 15,
-          qrbox: { width: 260, height: 260 },
-          aspectRatio: 1.0,
-        },
-        (decodedText) => {
-          handleScanSuccess(decodedText);
-        },
-        () => {
-          // ignore scan frame misses
-        }
-      );
+      setIsStreaming(true);
+      setIsLoadingCamera(false);
+      isScanningActive.current = true;
 
-      setIsScanning(true);
-
-      // Check torch
+      // Check if torch is supported on current video track
       try {
-        const capabilities = qrCodeScanner.getRunningTrackCapabilities();
+        const track = stream.getVideoTracks()[0];
+        // @ts-ignore
+        const capabilities = track.getCapabilities ? track.getCapabilities() : {};
         if (capabilities && 'torch' in capabilities) {
           setHasTorch(true);
+        } else {
+          setHasTorch(false);
         }
       } catch {
         setHasTorch(false);
       }
-    } catch (err: unknown) {
-      console.warn('Camera start error:', err);
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes('Permission') || errMsg.includes('NotAllowedError')) {
-        setCameraError(
-          'Izin kamera tidak diberikan. Mohon izinkan akses kamera di browser HP Anda atau gunakan tombol "Unggah Foto QR".'
-        );
-      } else {
-        setCameraError(
-          'Tidak dapat mengaktifkan kamera HP. Anda bisa mengunggah foto QR dari galeri atau mencoba tombol Uji Coba Cepat di bawah.'
-        );
-      }
-      setIsScanning(false);
-    }
-  };
 
-  // Stop Camera
-  const stopCamera = async () => {
-    if (html5QrCodeRef.current && html5QrCodeRef.current.isScanning) {
-      try {
-        await html5QrCodeRef.current.stop();
-      } catch (err) {
-        console.warn('Error stopping camera:', err);
+      // Start the frame detection loop
+      if (!animationFrameId.current) {
+        animationFrameId.current = requestAnimationFrame(scanLoop);
       }
     }
-    setIsScanning(false);
-  };
+  }, [facingMode, stopStream, scanLoop]);
 
-  // Toggle Camera Front / Back
+  // Flip camera front / back
   const toggleCameraFacing = async () => {
     const nextMode = facingMode === 'environment' ? 'user' : 'environment';
     setFacingMode(nextMode);
-    await stopCamera();
-    setTimeout(() => {
-      startCamera();
-    }, 200);
   };
 
-  // Toggle Torch/Flash
-  const toggleTorch = async () => {
-    if (html5QrCodeRef.current && html5QrCodeRef.current.isScanning) {
-      try {
-        await html5QrCodeRef.current.applyVideoConstraints({
-          advanced: [{ torch: !torchOn } as unknown as MediaTrackConstraintSet],
-        });
-        setTorchOn(!torchOn);
-      } catch (e) {
-        console.warn('Torch toggle failed:', e);
-      }
-    }
-  };
-
-  // Handle successful QR detection
-  const handleScanSuccess = async (text: string) => {
-    if (isProcessingScan.current) return;
-    isProcessingScan.current = true;
-
-    // 1. Try to parse item data from QR
-    const parsed = parseQRPayload(text);
-
-    // 2. Check if item exists in Firestore database
-    let matchedItem: Partial<Item> = parsed || {
-      id: `scanned_${Date.now()}`,
-      name: 'Barang Terpindai',
-      mfgDate: getTodayDateString(),
-      expDate: getTodayDateString(),
-      quantity: 1,
+  // Trigger camera start when facingMode changes or on mount
+  useEffect(() => {
+    startCamera();
+    return () => {
+      stopStream();
     };
+  }, [facingMode]);
 
-    if (parsed?.id) {
-      const foundInDb = existingItems.find((it) => it.id === parsed.id);
-      if (foundInDb) {
-        matchedItem = { ...foundInDb, ...parsed };
+  // Toggle Torch/Flashlight
+  const toggleTorch = async () => {
+    if (streamRef.current) {
+      const track = streamRef.current.getVideoTracks()[0];
+      if (track) {
+        try {
+          // @ts-ignore
+          await track.applyConstraints({
+            advanced: [{ torch: !torchOn } as unknown as MediaTrackConstraintSet],
+          });
+          setTorchOn(!torchOn);
+        } catch (e) {
+          console.warn('Torch toggle failed:', e);
+        }
       }
     }
-
-    setScannedItem(matchedItem);
-    setCurrentStock(typeof matchedItem.quantity === 'number' ? matchedItem.quantity : 1);
-
-    // 3. Calculate status according to prompt requirements
-    const calc = calculateExpiryStatus(
-      matchedItem.mfgDate || getTodayDateString(),
-      matchedItem.expDate || getTodayDateString()
-    );
-
-    // 4. Audio & Haptics Feedback
-    if (soundEnabled) {
-      playStatusAudio(calc.status);
-    }
-    triggerHaptic(calc.status);
-
-    // Confetti if green
-    if (calc.status === 'green') {
-      confetti({
-        particleCount: 25,
-        spread: 50,
-        origin: { y: 0.6 },
-      });
-    }
-
-    // 5. Automatically record scan event in Firestore
-    try {
-      await recordScan(matchedItem, calc.status, calc.daysRemaining);
-      setScanSavedFeedback(true);
-      setTimeout(() => setScanSavedFeedback(false), 2500);
-    } catch (e) {
-      console.warn('Could not record scan log:', e);
-    }
-
-    // Notice: we KEEP the camera frame open so user can see the AR transformation right over the camera!
   };
 
   // 1-Tap Stock Decrement (-1)
@@ -284,33 +402,36 @@ export const QRScanner: React.FC<QRScannerProps> = ({
     if (!file) return;
 
     try {
-      if (!html5QrCodeRef.current) {
-        html5QrCodeRef.current = new Html5Qrcode(readerElementId, {
-          formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
-          verbose: false,
-        });
-      }
-      const decoded = await html5QrCodeRef.current.scanFile(file, true);
-      handleScanSuccess(decoded);
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height);
+
+        if (code && code.data) {
+          isScanningActive.current = true;
+          handleScanSuccess(code.data);
+        } else {
+          alert('Tidak ditemukan kode QR pada gambar tersebut. Pastikan foto QR jelas dan tidak blur.');
+        }
+      };
+      img.src = URL.createObjectURL(file);
     } catch {
-      alert('Tidak ditemukan kode QR pada gambar tersebut. Coba foto dengan lebih jelas.');
+      alert('Gagal memproses gambar foto.');
     }
   };
 
-  // Clean up camera on unmount
-  useEffect(() => {
-    startCamera();
-    return () => {
-      stopCamera();
-    };
-  }, []);
-
   const resumeScanning = () => {
-    isProcessingScan.current = false;
     setScannedItem(null);
     setStockFeedback(null);
     setViewDetails(false);
-    if (!isScanning) {
+    isScanningActive.current = true;
+    if (!isStreaming) {
       startCamera();
     }
   };
@@ -361,6 +482,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       mfg: testItem.mfgDate,
       exp: testItem.expDate,
     });
+    isScanningActive.current = true;
     handleScanSuccess(payload);
   };
 
@@ -373,6 +495,9 @@ export const QRScanner: React.FC<QRScannerProps> = ({
 
   return (
     <div className="space-y-4 max-w-xl mx-auto pb-20">
+      {/* Hidden processing canvas */}
+      <canvas ref={canvasRef} className="hidden" />
+
       {/* Top Header Card */}
       <div className="bg-slate-900 border border-slate-800 rounded-3xl p-4 shadow-lg flex items-center justify-between">
         <div>
@@ -385,41 +510,59 @@ export const QRScanner: React.FC<QRScannerProps> = ({
             </h2>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            QR berubah warna otomatis (AR) + tombol kurangi stok 1x klik.
+            Target AR berubah warna otomatis + tombol kurangi stok 1x klik.
           </p>
         </div>
 
-        <button
-          onClick={() => setSoundEnabled(!soundEnabled)}
-          title={soundEnabled ? 'Matikan Suara' : 'Nyalakan Suara'}
-          className={`p-2 rounded-xl border transition-all active:scale-95 ${
-            soundEnabled
-              ? 'bg-slate-800 text-emerald-400 border-slate-700'
-              : 'bg-slate-800/50 text-slate-500 border-slate-800'
-          }`}
-        >
-          {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setSoundEnabled(!soundEnabled)}
+            title={soundEnabled ? 'Matikan Suara' : 'Nyalakan Suara'}
+            className={`p-2 rounded-xl border transition-all active:scale-95 ${
+              soundEnabled
+                ? 'bg-slate-800 text-emerald-400 border-slate-700'
+                : 'bg-slate-800/50 text-slate-500 border-slate-800'
+            }`}
+          >
+            {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+          </button>
+
+          <button
+            onClick={startCamera}
+            title="Muat Ulang Kamera"
+            className="p-2 rounded-xl bg-slate-800 text-cyan-400 border border-slate-700 active:scale-95 transition-all"
+          >
+            <RefreshCw className={`w-4 h-4 ${isLoadingCamera ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
       </div>
 
-      {/* Camera Viewport with AR (Augmented Reality) HUD Target System */}
+      {/* Camera Viewport with Augmented Reality (AR) HUD Target System */}
       <div className="bg-slate-900 border border-slate-800 rounded-3xl p-3 sm:p-4 shadow-2xl overflow-hidden relative">
-        <div className="relative w-full aspect-square max-w-sm mx-auto rounded-2xl overflow-hidden bg-black flex items-center justify-center">
-          {/* HTML5 QR Code Video Target */}
-          <div id={readerElementId} className="w-full h-full object-cover" />
+        <div className="relative w-full aspect-square max-w-sm mx-auto rounded-2xl overflow-hidden bg-black flex items-center justify-center shadow-inner">
+          {/* Native HTML5 Video Element */}
+          <video
+            ref={videoRef}
+            playsInline
+            autoPlay
+            muted
+            className={`w-full h-full object-cover transition-opacity duration-300 ${
+              isStreaming ? 'opacity-100' : 'opacity-0'
+            }`}
+          />
 
           {/* =========================================================================
               AUGMENTED REALITY (AR) HUD OVERLAY LAYER
               Changes color dynamically: Green, Yellow, or Red upon detection!
              ========================================================================= */}
-          {isScanning && !scannedItem && (
+          {isStreaming && !scannedItem && (
             /* Standby AR Scanning Reticle */
             <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-5">
               {/* AR Top Brackets */}
               <div className="flex justify-between items-start">
                 <div className="w-9 h-9 border-t-4 border-l-4 border-cyan-400 rounded-tl-xl shadow-[0_0_10px_#22d3ee]" />
                 <span className="text-[10px] font-mono tracking-widest text-cyan-300 bg-slate-950/80 px-2 py-0.5 rounded border border-cyan-500/40">
-                  AR SCANNER: ACTIVE
+                  AR LIVE: AKTIF
                 </span>
                 <div className="w-9 h-9 border-t-4 border-r-4 border-cyan-400 rounded-tr-xl shadow-[0_0_10px_#22d3ee]" />
               </div>
@@ -439,8 +582,8 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               {/* AR Bottom Brackets */}
               <div className="flex justify-between items-end">
                 <div className="w-9 h-9 border-b-4 border-l-4 border-cyan-400 rounded-bl-xl shadow-[0_0_10px_#22d3ee]" />
-                <span className="text-[9px] font-mono text-cyan-400/80 bg-slate-950/60 px-2 py-0.5 rounded">
-                  Arahkan QR ke dalam kotak
+                <span className="text-[9px] font-mono text-cyan-400/80 bg-slate-950/70 px-2 py-0.5 rounded">
+                  Arahkan QR ke kotak pemindai
                 </span>
                 <div className="w-9 h-9 border-b-4 border-r-4 border-cyan-400 rounded-br-xl shadow-[0_0_10px_#22d3ee]" />
               </div>
@@ -584,22 +727,50 @@ export const QRScanner: React.FC<QRScannerProps> = ({
             </div>
           )}
 
+          {/* Camera Loading Spinner */}
+          {isLoadingCamera && (
+            <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-6 text-center z-30">
+              <div className="w-10 h-10 border-4 border-cyan-500/20 border-t-cyan-400 rounded-full animate-spin mb-3" />
+              <p className="text-xs text-cyan-300 font-semibold">
+                Membuka Kamera HP...
+              </p>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Harap izinkan akses kamera pada pop-up browser
+              </p>
+            </div>
+          )}
+
           {/* Camera Error / Permission Missing State */}
-          {!isScanning && (
+          {!isStreaming && !isLoadingCamera && (
             <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center p-6 text-center z-30">
               <CameraOff className="w-12 h-12 text-slate-600 mb-3" />
               <h4 className="font-bold text-white text-sm mb-1">
                 Kamera Belum Aktif
               </h4>
-              <p className="text-xs text-slate-400 max-w-xs mb-4">
-                {cameraError || 'Klik tombol di bawah untuk menyalakan kamera HP Anda.'}
+              <p className="text-xs text-slate-400 max-w-xs mb-4 leading-relaxed">
+                {cameraError || 'Tekan tombol di bawah untuk menyalakan kamera HP Anda.'}
               </p>
-              <button
-                onClick={startCamera}
-                className="px-5 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold shadow-lg shadow-cyan-600/30 active:scale-95 transition-all"
-              >
-                Aktifkan Kamera Sekarang
-              </button>
+
+              <div className="flex flex-col gap-2 w-full max-w-xs">
+                <button
+                  onClick={startCamera}
+                  className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white text-xs font-bold shadow-lg shadow-cyan-600/30 active:scale-95 transition-all flex items-center justify-center gap-2"
+                >
+                  <Camera className="w-4 h-4" />
+                  <span>Aktifkan Kamera Sekarang</span>
+                </button>
+
+                {cameraError && (
+                  <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800 text-[11px] text-slate-400 text-left space-y-1">
+                    <span className="font-semibold text-cyan-400 flex items-center gap-1">
+                      <HelpCircle className="w-3.5 h-3.5" />
+                      <span>Tips jika kamera tidak muncul:</span>
+                    </span>
+                    <p>• Ketuk ikon gembok / izin situs di bilah browser HP dan izinkan "Camera".</p>
+                    <p>• Atau gunakan tombol "Unggah Foto QR" di bawah.</p>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -677,7 +848,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
                 type="button"
                 onClick={handleDecrementStock}
                 disabled={isUpdatingStock || currentStock <= 0}
-                className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-rose-600 via-red-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 active:scale-95 text-white font-extrabold text-sm shadow-lg shadow-rose-600/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                className="flex-1 py-3.5 px-4 rounded-xl bg-gradient-to-r from-rose-600 via-red-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 active:scale-95 text-white font-extrabold text-sm shadow-lg shadow-rose-600/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
               >
                 <MinusCircle className="w-5 h-5 text-white" />
                 <span>-1 Kurangi Stok (Keluar Barang)</span>
@@ -689,7 +860,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
                 onClick={handleIncrementStock}
                 disabled={isUpdatingStock}
                 title="Tambah Stok (+1)"
-                className="p-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 active:scale-95 transition-all"
+                className="p-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 active:scale-95 transition-all"
               >
                 <PlusCircle className="w-5 h-5 text-emerald-400" />
               </button>
