@@ -1,0 +1,142 @@
+{
+  "entities": {
+    "Item": {
+      "title": "Item",
+      "description": "Barang atau produk dengan tanggal produksi dan tanggal kedaluwarsa beserta data pelengkap.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "ID unik dokumen barang"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Nama produk atau barang"
+        },
+        "mfgDate": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "description": "Tanggal pembuatan / produksi barang (YYYY-MM-DD)"
+        },
+        "expDate": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "description": "Tanggal kedaluwarsa barang (YYYY-MM-DD)"
+        },
+        "batchNumber": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "Nomor lot / batch produksi"
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "Kategori barang (contoh: Makanan, Minuman, Obat, Kosmetik, Kimia)"
+        },
+        "quantity": {
+          "type": "number",
+          "description": "Jumlah stok barang saat ini"
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Satuan unit (pcs, botol, box, kg)"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Catatan tambahan atau lokasi rak penyimpanan"
+        },
+        "qrPayload": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Payload teks data QR terenkode"
+        },
+        "scannedCount": {
+          "type": "number",
+          "description": "Frekuensi berapa kali QR barang ini telah dipindai"
+        },
+        "lastScannedAt": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "Waktu terakhir barang dipindai"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Waktu pembuatan data barang"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Waktu pembaruan data barang"
+        },
+        "createdBy": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "UID pengguna pembuat atau identifier perangkat"
+        }
+      },
+      "required": ["id", "name", "mfgDate", "expDate"]
+    },
+    "ScanLog": {
+      "title": "ScanLog",
+      "description": "Riwayat pemindaian barang secara real-time antar perangkat.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "ID unik log pemindaian"
+        },
+        "itemId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "ID barang yang dipindai"
+        },
+        "itemName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Nama barang saat dipindai"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["green", "yellow", "red"],
+          "description": "Status kedaluwarsa saat dipindai: green (aman), yellow (pertengahan), red (kedaluwarsa)"
+        },
+        "daysRemaining": {
+          "type": "number",
+          "description": "Sisa hari menjelang kedaluwarsa saat scan"
+        },
+        "scannedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Waktu pemindaian"
+        },
+        "deviceInfo": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Tipe perangkat pemindai (e.g., Mobile Android / iPhone)"
+        }
+      },
+      "required": ["id", "itemId", "status"]
+    }
+  },
+  "firestore": {
+    "/items/{itemId}": {
+      "schema": { "$ref": "#/entities/Item" },
+      "description": "Koleksi data master barang real-time"
+    },
+    "/scans/{scanId}": {
+      "schema": { "$ref": "#/entities/ScanLog" },
+      "description": "Koleksi log pemindaian kamera HP secara real-time"
+    }
+  }
+}

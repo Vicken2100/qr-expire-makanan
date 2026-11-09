@@ -1,0 +1,8 @@
+{
+  "name": "QR ExpireTracker - Realtime QR & Expiry",
+  "description": "Generator dan pemindai QR pintar dengan deteksi tanggal kedaluwarsa berkode warna (Merah, Kuning, Hijau), sinkronisasi real-time multi-perangkat via Firebase, dan antarmuka smartphone-friendly.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

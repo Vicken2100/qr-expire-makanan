@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 1rem);
+  }
+
+  @keyframes ar-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes ar-spin-reverse {
+    from {
+      transform: rotate(360deg);
+    }
+    to {
+      transform: rotate(0deg);
+    }
+  }
+
+  @keyframes ar-radar {
+    0% {
+      top: 0%;
+      opacity: 0.8;
+    }
+    50% {
+      opacity: 1;
+    }
+    100% {
+      top: 100%;
+      opacity: 0.2;
+    }
+  }
+
+  .animate-ar-spin {
+    animation: ar-spin 12s linear infinite;
+  }
+
+  .animate-ar-spin-fast {
+    animation: ar-spin 4s linear infinite;
+  }
+
+  .animate-ar-spin-reverse {
+    animation: ar-spin-reverse 8s linear infinite;
+  }
+
+  .animate-ar-radar {
+    animation: ar-radar 2.5s ease-in-out infinite;
+  }
+}
+
+/* Print Styles for thermal printer & sticker labels */
+@media print {
+  body {
+    background: white !important;
+    color: black !important;
+  }
+
+  header,
+  nav,
+  button,
+  .no-print {
+    display: none !important;
+  }
+
+  #printable-label {
+    box-shadow: none !important;
+    border: 1px solid #000 !important;
+    margin: 0 auto !important;
+    page-break-inside: avoid !important;
+  }
+}
