@@ -145,14 +145,28 @@ export async function deleteItem(itemId: string): Promise<void> {
 }
 
 /**
- * Decrements stock by delta (default -1) and persists in real-time to Firestore
+ * Decrements stock by delta (default -1).
+ * If new quantity <= 0, automatically deletes the item from Firestore so it immediately disappears from stock!
  */
 export async function decrementOrUpdateItemStock(
   item: Partial<Item>,
   delta: number = -1
-): Promise<{ item: Item; newQty: number }> {
+): Promise<{ item: Item | null; newQty: number; deleted: boolean }> {
   const currentQty = typeof item.quantity === 'number' ? item.quantity : 1;
-  const newQty = Math.max(0, currentQty + delta);
+  const newQty = currentQty + delta;
+
+  // If stock runs out (<= 0), immediately delete from Firestore so it vanishes from stock
+  if (newQty <= 0) {
+    if (item.id && !item.id.startsWith('unknown_')) {
+      await deleteItem(item.id);
+    }
+    return {
+      item: null,
+      newQty: 0,
+      deleted: true,
+    };
+  }
+
   const nowIso = new Date().toISOString();
 
   if (item.id && !item.id.startsWith('unknown_')) {
@@ -164,6 +178,7 @@ export async function decrementOrUpdateItemStock(
       return {
         item: { ...item, quantity: newQty, updatedAt: nowIso } as Item,
         newQty,
+        deleted: false,
       };
     } catch {
       // If document does not exist yet in Firestore, save it fully
@@ -175,7 +190,7 @@ export async function decrementOrUpdateItemStock(
     ...item,
     quantity: newQty,
   });
-  return { item: saved, newQty };
+  return { item: saved, newQty, deleted: false };
 }
 
 /**

@@ -43,8 +43,11 @@ export const ItemList: React.FC<ItemListProps> = ({
   } | null>(null);
   const [isDeleting, setIsDeleting] = useState<string | null>(null);
 
+  // Only active items with quantity > 0 are considered in stock
+  const inStockItems = items.filter((it) => (it.quantity ?? 1) > 0);
+
   // Calculate stats
-  const itemsWithCalc = items.map((it) => ({
+  const itemsWithCalc = inStockItems.map((it) => ({
     ...it,
     calc: calculateExpiryStatus(it.mfgDate, it.expDate),
   }));
@@ -98,9 +101,14 @@ export const ItemList: React.FC<ItemListProps> = ({
   };
 
   const handleUpdateQuantity = async (item: Item, delta: number) => {
-    const newQty = Math.max(0, (item.quantity ?? 1) + delta);
+    const newQty = (item.quantity ?? 1) + delta;
     try {
-      await saveItem({ ...item, quantity: newQty });
+      if (newQty <= 0) {
+        // Stock runs out (0): immediately delete and remove from stock!
+        await deleteItem(item.id);
+      } else {
+        await saveItem({ ...item, quantity: newQty });
+      }
     } catch (err) {
       console.warn('Error updating quantity:', err);
     }

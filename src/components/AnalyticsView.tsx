@@ -24,7 +24,9 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
   recentScans,
   onSelectTab,
 }) => {
-  const itemsWithCalc = items.map((it) => ({
+  const inStockItems = items.filter((it) => (it.quantity ?? 1) > 0);
+
+  const itemsWithCalc = inStockItems.map((it) => ({
     ...it,
     calc: calculateExpiryStatus(it.mfgDate, it.expDate),
   }));
@@ -33,7 +35,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
   const yellowItems = itemsWithCalc.filter((i) => i.calc.status === 'yellow');
   const redItems = itemsWithCalc.filter((i) => i.calc.status === 'red');
 
-  const total = items.length || 1;
+  const total = inStockItems.length || 1;
   const greenPct = Math.round((greenItems.length / total) * 100);
   const yellowPct = Math.round((yellowItems.length / total) * 100);
   const redPct = Math.round((redItems.length / total) * 100);

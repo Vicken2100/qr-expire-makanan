@@ -116,6 +116,9 @@ export default function App() {
                     prev.map((it) => (it.id === updated.id ? updated : it))
                   );
                 }}
+                onItemDeleted={(deletedId) => {
+                  setItems((prev) => prev.filter((it) => it.id !== deletedId));
+                }}
                 onNavigateToGenerator={handleNavigateToGeneratorWithData}
               />
             )}

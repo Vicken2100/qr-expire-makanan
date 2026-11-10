@@ -10,7 +10,6 @@ import {
   CheckCircle2,
   AlertCircle,
   Clock,
-  RotateCcw,
   Sparkles,
   Volume2,
   VolumeX,
@@ -21,10 +20,9 @@ import {
   ChevronDown,
   ChevronUp,
   RefreshCw,
-  HelpCircle,
-  Zap,
+  Scan,
 } from 'lucide-react';
-import { Item } from '../types';
+import { Item, ExpiryStatus } from '../types';
 import {
   calculateExpiryStatus,
   parseQRPayload,
@@ -32,7 +30,11 @@ import {
   getTodayDateString,
   addDaysToDateString,
 } from '../utils/expiry';
-import { playStatusAudio, triggerHaptic, playStockDecrementSound } from '../utils/audio';
+import {
+  playStatusAudio,
+  triggerHaptic,
+  playStockDecrementSound,
+} from '../utils/audio';
 import {
   recordScan,
   decrementOrUpdateItemStock,
@@ -42,23 +44,28 @@ import confetti from 'canvas-confetti';
 interface QRScannerProps {
   existingItems: Item[];
   onItemUpdated?: (item: Item) => void;
+  onItemDeleted?: (itemId: string) => void;
   onNavigateToGenerator?: (itemData: Partial<Item>) => void;
 }
 
 export const QRScanner: React.FC<QRScannerProps> = ({
   existingItems,
   onItemUpdated,
+  onItemDeleted,
   onNavigateToGenerator,
 }) => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isLoadingCamera, setIsLoadingCamera] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
-  const [scannedItem, setScannedItem] = useState<Partial<Item> | null>(null);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [torchOn, setTorchOn] = useState(false);
   const [hasTorch, setHasTorch] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [viewDetails, setViewDetails] = useState(false);
+
+  // Active Scanned Item (Updates continuously on live scan)
+  const [scannedItem, setScannedItem] = useState<Partial<Item> | null>(null);
+  const [activeStatus, setActiveStatus] = useState<ExpiryStatus | null>(null);
 
   // Stock mutation state
   const [currentStock, setCurrentStock] = useState<number>(0);
@@ -66,10 +73,17 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const [stockFeedback, setStockFeedback] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const processingCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationFrameId = useRef<number | null>(null);
-  const isScanningActive = useRef<boolean>(true);
+
+  // State trackers for continuous scanning
+  const lastScannedRawRef = useRef<string>('');
+  const lastDetectedLocationRef = useRef<any>(null);
+  const lastDetectedStatusRef = useRef<ExpiryStatus | null>(null);
+  const lastDetectedItemRef = useRef<Partial<Item> | null>(null);
+  const lastDetectedTimestampRef = useRef<number>(0);
 
   // Stop camera media stream
   const stopStream = useCallback(() => {
@@ -93,130 +107,229 @@ export const QRScanner: React.FC<QRScannerProps> = ({
     setTorchOn(false);
   }, []);
 
-  // Handle successful QR detection
-  const handleScanSuccess = useCallback(
-    async (text: string) => {
-      if (!isScanningActive.current) return;
-      isScanningActive.current = false; // Lock until user resumes or actions
-
-      // 1. Parse item data from QR
-      const parsed = parseQRPayload(text);
-
-      // 2. Check if item exists in Firestore database
-      let matchedItem: Partial<Item> = parsed || {
-        id: `scanned_${Date.now()}`,
-        name: 'Barang Terpindai',
-        mfgDate: getTodayDateString(),
-        expDate: getTodayDateString(),
-        quantity: 1,
-      };
-
-      if (parsed?.id) {
-        const foundInDb = existingItems.find((it) => it.id === parsed.id);
-        if (foundInDb) {
-          matchedItem = { ...foundInDb, ...parsed };
-        }
-      }
-
-      setScannedItem(matchedItem);
-      const stock = typeof matchedItem.quantity === 'number' ? matchedItem.quantity : 1;
-      setCurrentStock(stock);
-
-      // 3. Calculate status according to prompt requirements
-      const calc = calculateExpiryStatus(
-        matchedItem.mfgDate || getTodayDateString(),
-        matchedItem.expDate || getTodayDateString()
-      );
-
-      // 4. Audio & Haptics Feedback
-      if (soundEnabled) {
-        playStatusAudio(calc.status);
-      }
-      triggerHaptic(calc.status);
-
-      // Confetti if green
-      if (calc.status === 'green') {
-        confetti({
-          particleCount: 25,
-          spread: 50,
-          origin: { y: 0.6 },
-        });
-      }
-
-      // 5. Automatically record scan event in Firestore
-      try {
-        await recordScan(matchedItem, calc.status, calc.daysRemaining);
-      } catch (e) {
-        console.warn('Could not record scan log:', e);
-      }
-    },
-    [existingItems, soundEnabled]
-  );
-
-  // Continuous frame scanner loop using BarcodeDetector or jsQR
+  /**
+   * Continuous frame scanner loop:
+   * Analyzes camera feed continuously, detects QR codes in real-time,
+   * and draws the dynamic AR color highlight (Green/Yellow/Red) directly over the QR code!
+   */
   const scanLoop = useCallback(() => {
-    if (!videoRef.current || !canvasRef.current || !isScanningActive.current) {
+    if (!videoRef.current || !processingCanvasRef.current || !overlayCanvasRef.current) {
       animationFrameId.current = requestAnimationFrame(scanLoop);
       return;
     }
 
     const video = videoRef.current;
+    const procCanvas = processingCanvasRef.current;
+    const overlayCanvas = overlayCanvasRef.current;
+
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+      const overlayCtx = overlayCanvas.getContext('2d');
 
-      if (ctx) {
+      if (procCtx && overlayCtx) {
         // Match canvas dimensions to video
-        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-          canvas.width = video.videoWidth || 640;
-          canvas.height = video.videoHeight || 480;
+        const width = video.videoWidth || 640;
+        const height = video.videoHeight || 480;
+
+        if (procCanvas.width !== width || procCanvas.height !== height) {
+          procCanvas.width = width;
+          procCanvas.height = height;
         }
 
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        // Check if native BarcodeDetector API exists (super fast on modern Android Chrome / iOS)
-        if ('BarcodeDetector' in window) {
-          try {
-            // @ts-ignore
-            const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
-            detector
-              .detect(video)
-              .then((barcodes: Array<{ rawValue: string }>) => {
-                if (barcodes && barcodes.length > 0 && isScanningActive.current) {
-                  handleScanSuccess(barcodes[0].rawValue);
-                  return;
-                }
-              })
-              .catch(() => {
-                // Fallback to jsQR
-              });
-          } catch {
-            // Fallback to jsQR
-          }
+        if (overlayCanvas.width !== width || overlayCanvas.height !== height) {
+          overlayCanvas.width = width;
+          overlayCanvas.height = height;
         }
 
-        // Standard jsQR fallback (100% cross-platform compatibility)
-        if (isScanningActive.current) {
-          try {
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-              inversionAttempts: 'dontInvert',
-            });
+        // Draw current video frame to processing canvas
+        procCtx.drawImage(video, 0, 0, width, height);
 
-            if (code && code.data && code.data.trim() && isScanningActive.current) {
-              handleScanSuccess(code.data);
+        // Detect QR using jsQR
+        let detectedCode = null;
+        try {
+          const imageData = procCtx.getImageData(0, 0, width, height);
+          detectedCode = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert',
+          });
+        } catch {
+          // ignore scan frame exception
+        }
+
+        const now = Date.now();
+
+        // If a QR is detected in the current frame
+        if (detectedCode && detectedCode.data && detectedCode.data.trim()) {
+          const rawText = detectedCode.data.trim();
+          lastDetectedLocationRef.current = detectedCode.location;
+          lastDetectedTimestampRef.current = now;
+
+          // If it's a new or changed QR code, update state and trigger audio/haptics!
+          if (rawText !== lastScannedRawRef.current) {
+            lastScannedRawRef.current = rawText;
+
+            const parsed = parseQRPayload(rawText);
+            let matchedItem: Partial<Item> = parsed || {
+              id: `scanned_${Date.now()}`,
+              name: 'Barang Terpindai',
+              mfgDate: getTodayDateString(),
+              expDate: getTodayDateString(),
+              quantity: 1,
+            };
+
+            if (parsed?.id) {
+              const foundInDb = existingItems.find((it) => it.id === parsed.id);
+              if (foundInDb) {
+                matchedItem = { ...foundInDb, ...parsed };
+              }
             }
-          } catch (e) {
-            // ignore scan frame exception
+
+            const calc = calculateExpiryStatus(
+              matchedItem.mfgDate || getTodayDateString(),
+              matchedItem.expDate || getTodayDateString()
+            );
+
+            lastDetectedStatusRef.current = calc.status;
+            lastDetectedItemRef.current = matchedItem;
+
+            setScannedItem(matchedItem);
+            setActiveStatus(calc.status);
+            const stock = typeof matchedItem.quantity === 'number' ? matchedItem.quantity : 1;
+            setCurrentStock(stock);
+
+            // Audio & Haptic feedback on detection of new QR
+            if (soundEnabled) {
+              playStatusAudio(calc.status);
+            }
+            triggerHaptic(calc.status);
+
+            if (calc.status === 'green') {
+              confetti({
+                particleCount: 20,
+                spread: 45,
+                origin: { y: 0.7 },
+              });
+            }
+
+            // Record scan log in Firebase
+            try {
+              recordScan(matchedItem, calc.status, calc.daysRemaining);
+            } catch (e) {
+              console.warn('Could not record scan log:', e);
+            }
           }
+        }
+
+        // =========================================================================
+        // DRAW LIVE AR COLOR HIGHLIGHT DIRECTLY OVER THE QR CODE IN REAL TIME!
+        // =========================================================================
+        overlayCtx.clearRect(0, 0, width, height);
+
+        // Render AR overlay if detected recently (within last 350ms to prevent visual flickering)
+        const isRecentlyDetected = now - lastDetectedTimestampRef.current < 350;
+        const location = lastDetectedLocationRef.current;
+        const status = lastDetectedStatusRef.current;
+        const item = lastDetectedItemRef.current;
+
+        if (isRecentlyDetected && location && status && item) {
+          const { topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner } = location;
+
+          const colorHex =
+            status === 'red' ? '#ef4444' : status === 'yellow' ? '#f59e0b' : '#10b981';
+
+          const bgFill =
+            status === 'red'
+              ? 'rgba(239, 68, 68, 0.35)'
+              : status === 'yellow'
+              ? 'rgba(245, 158, 11, 0.35)'
+              : 'rgba(16, 185, 129, 0.35)';
+
+          overlayCtx.save();
+
+          // 1. Fill QR polygon with vibrant color tint
+          overlayCtx.fillStyle = bgFill;
+          overlayCtx.beginPath();
+          overlayCtx.moveTo(topLeftCorner.x, topLeftCorner.y);
+          overlayCtx.lineTo(topRightCorner.x, topRightCorner.y);
+          overlayCtx.lineTo(bottomRightCorner.x, bottomRightCorner.y);
+          overlayCtx.lineTo(bottomLeftCorner.x, bottomLeftCorner.y);
+          overlayCtx.closePath();
+          overlayCtx.fill();
+
+          // 2. Neon glowing border on the 4 edges of the QR code
+          overlayCtx.lineWidth = 6;
+          overlayCtx.strokeStyle = colorHex;
+          overlayCtx.shadowColor = colorHex;
+          overlayCtx.shadowBlur = 16;
+          overlayCtx.beginPath();
+          overlayCtx.moveTo(topLeftCorner.x, topLeftCorner.y);
+          overlayCtx.lineTo(topRightCorner.x, topRightCorner.y);
+          overlayCtx.lineTo(bottomRightCorner.x, bottomRightCorner.y);
+          overlayCtx.lineTo(bottomLeftCorner.x, bottomLeftCorner.y);
+          overlayCtx.closePath();
+          overlayCtx.stroke();
+
+          // 3. Draw targeting corner pins
+          [topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner].forEach((pt) => {
+            overlayCtx.fillStyle = '#ffffff';
+            overlayCtx.beginPath();
+            overlayCtx.arc(pt.x, pt.y, 7, 0, Math.PI * 2);
+            overlayCtx.fill();
+            overlayCtx.strokeStyle = colorHex;
+            overlayCtx.lineWidth = 3;
+            overlayCtx.stroke();
+          });
+
+          // 4. Floating Hologram Badge Tag anchored right above the QR code
+          const badgeX = Math.min(topLeftCorner.x, topRightCorner.x);
+          const badgeY = Math.min(topLeftCorner.y, topRightCorner.y) - 18;
+
+          const calcInfo = calculateExpiryStatus(
+            item.mfgDate || getTodayDateString(),
+            item.expDate || getTodayDateString()
+          );
+
+          const badgeTitle =
+            status === 'red'
+              ? `🔴 KEDALUWARSA (${calcInfo.daysRemaining === 0 ? 'HARI INI EXP' : `${Math.abs(calcInfo.daysRemaining)}h lalu`})`
+              : status === 'yellow'
+              ? `🟡 PERTENGAHAN EXP (Sisa ${calcInfo.daysRemaining} Hari)`
+              : `🟢 AMAN & SEGAR (Sisa ${calcInfo.daysRemaining} Hari)`;
+
+          const fontSize = Math.max(14, Math.round(width / 42));
+          overlayCtx.font = `bold ${fontSize}px sans-serif`;
+          const textMetrics = overlayCtx.measureText(badgeTitle);
+          const badgeW = textMetrics.width + 24;
+          const badgeH = fontSize + 14;
+
+          overlayCtx.fillStyle = colorHex;
+          overlayCtx.beginPath();
+          overlayCtx.roundRect(
+            Math.max(10, badgeX - 10),
+            Math.max(10, badgeY - badgeH),
+            badgeW,
+            badgeH,
+            8
+          );
+          overlayCtx.fill();
+
+          overlayCtx.fillStyle = status === 'yellow' ? '#0f172a' : '#ffffff';
+          overlayCtx.shadowBlur = 0;
+          overlayCtx.fillText(
+            badgeTitle,
+            Math.max(10, badgeX - 10) + 12,
+            Math.max(10, badgeY - badgeH) + fontSize + 2
+          );
+
+          overlayCtx.restore();
         }
       }
     }
 
+    // Keep scanning continuously!
     animationFrameId.current = requestAnimationFrame(scanLoop);
-  }, [handleScanSuccess]);
+  }, [existingItems, soundEnabled]);
 
-  // Robust Camera Starter with automatic fallback constraints
+  // Robust Camera Starter
   const startCamera = useCallback(async () => {
     setIsLoadingCamera(true);
     setCameraError(null);
@@ -224,7 +337,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError(
-        'Peramban ini tidak mendukung akses kamera secara langsung (MediaDevices API tidak tersedia). Silakan gunakan tombol "Unggah Foto QR" dari galeri HP atau buka aplikasi via browser modern seperti Chrome/Safari.'
+        'Peramban ini tidak mendukung akses kamera secara langsung (MediaDevices API tidak tersedia). Gunakan browser Chrome/Safari modern atau upload foto QR dari galeri.'
       );
       setIsLoadingCamera(false);
       return;
@@ -232,7 +345,6 @@ export const QRScanner: React.FC<QRScannerProps> = ({
 
     let stream: MediaStream | null = null;
 
-    // Strategy 1: Ideal facingMode for mobile rear camera
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -244,7 +356,6 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       });
     } catch (err1) {
       console.warn('Strategy 1 camera request failed, trying simple video constraint...', err1);
-      // Strategy 2: Simple video constraint (works on laptops & stubborn smartphone webcams)
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: true,
@@ -260,10 +371,8 @@ export const QRScanner: React.FC<QRScannerProps> = ({
           errMsg.includes('denied')
         ) {
           setCameraError(
-            'Izin akses kamera diblokir oleh browser. Silakan ketuk ikon gembok / perizinan situs di bilah alamat browser HP Anda, aktifkan izin Kamera, lalu tekan "Coba Lagi". Anda juga dapat menggunakan tombol "Unggah Foto QR" di bawah.'
+            'Izin akses kamera diblokir browser. Ketuk ikon gembok / izin situs di bilah alamat browser HP Anda, aktifkan izin Kamera, lalu tekan "Coba Lagi".'
           );
-        } else if (errMsg.includes('NotFound') || errMsg.includes('DevicesNotFoundError')) {
-          setCameraError('Kamera tidak ditemukan pada perangkat Anda.');
         } else {
           setCameraError(
             `Kamera belum dapat dibuka (${errMsg}). Silakan coba tekan "Coba Lagi" atau gunakan opsi "Unggah Foto QR" dari galeri.`
@@ -287,9 +396,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
 
       setIsStreaming(true);
       setIsLoadingCamera(false);
-      isScanningActive.current = true;
 
-      // Check if torch is supported on current video track
       try {
         const track = stream.getVideoTracks()[0];
         // @ts-ignore
@@ -303,7 +410,6 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         setHasTorch(false);
       }
 
-      // Start the frame detection loop
       if (!animationFrameId.current) {
         animationFrameId.current = requestAnimationFrame(scanLoop);
       }
@@ -316,7 +422,6 @@ export const QRScanner: React.FC<QRScannerProps> = ({
     setFacingMode(nextMode);
   };
 
-  // Trigger camera start when facingMode changes or on mount
   useEffect(() => {
     startCamera();
     return () => {
@@ -353,17 +458,38 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         navigator.vibrate([60]);
       }
 
-      const { item: updated, newQty } = await decrementOrUpdateItemStock(
+      const currentItemName = scannedItem.name || 'Barang';
+      const currentItemId = scannedItem.id;
+
+      const { item: updated, newQty, deleted } = await decrementOrUpdateItemStock(
         { ...scannedItem, quantity: currentStock },
         -1
       );
 
-      setCurrentStock(newQty);
-      setScannedItem(updated);
-      if (onItemUpdated) onItemUpdated(updated);
+      if (deleted) {
+        // Stock reached 0: automatically removed from Firestore and UI!
+        setCurrentStock(0);
+        setScannedItem(null);
+        lastDetectedItemRef.current = null;
+        lastDetectedStatusRef.current = null;
+        lastDetectedLocationRef.current = null;
+        lastScannedRawRef.current = '';
 
-      setStockFeedback(`-1 Barang Keluar! Sisa: ${newQty} ${scannedItem.unit || 'pcs'}`);
-      setTimeout(() => setStockFeedback(null), 3000);
+        if (currentItemId && onItemDeleted) {
+          onItemDeleted(currentItemId);
+        }
+
+        setStockFeedback(`Stok "${currentItemName}" telah habis dan langsung otomatis dihapus dari daftar stok!`);
+        setTimeout(() => setStockFeedback(null), 4000);
+      } else if (updated) {
+        setCurrentStock(newQty);
+        setScannedItem(updated);
+        lastDetectedItemRef.current = updated;
+        if (onItemUpdated) onItemUpdated(updated);
+
+        setStockFeedback(`-1 Barang Keluar! Sisa: ${newQty} ${scannedItem.unit || 'pcs'}`);
+        setTimeout(() => setStockFeedback(null), 3000);
+      }
     } catch (err) {
       console.error('Error decrementing stock:', err);
       alert('Gagal memperbarui stok di Firebase.');
@@ -383,9 +509,12 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         1
       );
 
-      setCurrentStock(newQty);
-      setScannedItem(updated);
-      if (onItemUpdated) onItemUpdated(updated);
+      if (updated) {
+        setCurrentStock(newQty);
+        setScannedItem(updated);
+        lastDetectedItemRef.current = updated;
+        if (onItemUpdated) onItemUpdated(updated);
+      }
 
       setStockFeedback(`+1 Ditambahkan! Sisa: ${newQty} ${scannedItem.unit || 'pcs'}`);
       setTimeout(() => setStockFeedback(null), 3000);
@@ -404,18 +533,40 @@ export const QRScanner: React.FC<QRScannerProps> = ({
     try {
       const img = new Image();
       img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext('2d');
+        const uploadCanvas = document.createElement('canvas');
+        uploadCanvas.width = img.width;
+        uploadCanvas.height = img.height;
+        const ctx = uploadCanvas.getContext('2d');
         if (!ctx) return;
         ctx.drawImage(img, 0, 0);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, uploadCanvas.width, uploadCanvas.height);
         const code = jsQR(imageData.data, imageData.width, imageData.height);
 
         if (code && code.data) {
-          isScanningActive.current = true;
-          handleScanSuccess(code.data);
+          const parsed = parseQRPayload(code.data);
+          let matchedItem: Partial<Item> = parsed || {
+            id: `scanned_${Date.now()}`,
+            name: 'Barang Terpindai',
+            mfgDate: getTodayDateString(),
+            expDate: getTodayDateString(),
+            quantity: 1,
+          };
+          setScannedItem(matchedItem);
+          const stock = typeof matchedItem.quantity === 'number' ? matchedItem.quantity : 1;
+          setCurrentStock(stock);
+
+          const calc = calculateExpiryStatus(
+            matchedItem.mfgDate || getTodayDateString(),
+            matchedItem.expDate || getTodayDateString()
+          );
+
+          setActiveStatus(calc.status);
+          lastDetectedStatusRef.current = calc.status;
+          lastDetectedItemRef.current = matchedItem;
+          lastScannedRawRef.current = code.data;
+
+          if (soundEnabled) playStatusAudio(calc.status);
+          triggerHaptic(calc.status);
         } else {
           alert('Tidak ditemukan kode QR pada gambar tersebut. Pastikan foto QR jelas dan tidak blur.');
         }
@@ -426,17 +577,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
     }
   };
 
-  const resumeScanning = () => {
-    setScannedItem(null);
-    setStockFeedback(null);
-    setViewDetails(false);
-    isScanningActive.current = true;
-    if (!isStreaming) {
-      startCamera();
-    }
-  };
-
-  // Quick Test Buttons for Instant Verification (Hijau, Kuning, Merah)
+  // Quick Test Buttons for Instant Live Demonstration (Hijau, Kuning, Merah)
   const handleQuickTest = (type: 'green' | 'yellow' | 'red') => {
     const today = getTodayDateString();
     let testItem: Partial<Item>;
@@ -476,14 +617,35 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       };
     }
 
-    const payload = JSON.stringify({
-      app: 'qrexp',
-      ...testItem,
-      mfg: testItem.mfgDate,
-      exp: testItem.expDate,
-    });
-    isScanningActive.current = true;
-    handleScanSuccess(payload);
+    const calc = calculateExpiryStatus(testItem.mfgDate!, testItem.expDate!);
+
+    setScannedItem(testItem);
+    setCurrentStock(testItem.quantity || 1);
+    setActiveStatus(calc.status);
+
+    lastDetectedStatusRef.current = calc.status;
+    lastDetectedItemRef.current = testItem;
+    lastScannedRawRef.current = JSON.stringify(testItem);
+    lastDetectedTimestampRef.current = Date.now();
+
+    // Mock center position on overlay canvas
+    if (overlayCanvasRef.current) {
+      const w = overlayCanvasRef.current.width || 640;
+      const h = overlayCanvasRef.current.height || 480;
+      const cx = w / 2;
+      const cy = h / 2;
+      const s = Math.min(w, h) * 0.28;
+
+      lastDetectedLocationRef.current = {
+        topLeftCorner: { x: cx - s, y: cy - s },
+        topRightCorner: { x: cx + s, y: cy - s },
+        bottomRightCorner: { x: cx + s, y: cy + s },
+        bottomLeftCorner: { x: cx - s, y: cy + s },
+      };
+    }
+
+    if (soundEnabled) playStatusAudio(calc.status);
+    triggerHaptic(calc.status);
   };
 
   const calc = scannedItem
@@ -496,21 +658,24 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   return (
     <div className="space-y-4 max-w-xl mx-auto pb-20">
       {/* Hidden processing canvas */}
-      <canvas ref={canvasRef} className="hidden" />
+      <canvas ref={processingCanvasRef} className="hidden" />
 
       {/* Top Header Card */}
       <div className="bg-slate-900 border border-slate-800 rounded-3xl p-4 shadow-lg flex items-center justify-between">
         <div>
           <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-cyan-500/20 text-cyan-400 flex items-center justify-center">
-              <Camera className="w-4 h-4" />
+            <div className="w-7 h-7 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center animate-pulse">
+              <Scan className="w-4 h-4" />
             </div>
-            <h2 className="text-base font-bold text-white tracking-tight">
-              Kamera AR Scanner & Stok
+            <h2 className="text-base font-bold text-white tracking-tight flex items-center gap-1.5">
+              <span>Pemindai Live Berkelanjutan</span>
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-300 border border-emerald-800">
+                LIVE AR
+              </span>
             </h2>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            Target AR berubah warna otomatis + tombol kurangi stok 1x klik.
+            Kamera aktif terus-menerus. Warna otomatis berubah di atas setiap QR baru!
           </p>
         </div>
 
@@ -537,10 +702,13 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         </div>
       </div>
 
-      {/* Camera Viewport with Augmented Reality (AR) HUD Target System */}
+      {/* =========================================================================
+          CONTINUOUS LIVE CAMERA VIEWPORT
+          Video stays active continuously. AR overlay directly changes color on the QR code!
+         ========================================================================= */}
       <div className="bg-slate-900 border border-slate-800 rounded-3xl p-3 sm:p-4 shadow-2xl overflow-hidden relative">
         <div className="relative w-full aspect-square max-w-sm mx-auto rounded-2xl overflow-hidden bg-black flex items-center justify-center shadow-inner">
-          {/* Native HTML5 Video Element */}
+          {/* Continuous Live Video */}
           <video
             ref={videoRef}
             playsInline
@@ -551,178 +719,32 @@ export const QRScanner: React.FC<QRScannerProps> = ({
             }`}
           />
 
-          {/* =========================================================================
-              AUGMENTED REALITY (AR) HUD OVERLAY LAYER
-              Changes color dynamically: Green, Yellow, or Red upon detection!
-             ========================================================================= */}
-          {isStreaming && !scannedItem && (
-            /* Standby AR Scanning Reticle */
-            <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-5">
-              {/* AR Top Brackets */}
+          {/* Real-time Augmented Reality (AR) Overlay Canvas directly above the video */}
+          <canvas
+            ref={overlayCanvasRef}
+            className="absolute inset-0 w-full h-full object-cover pointer-events-none z-10"
+          />
+
+          {/* Standby Viewfinder Radar (Displayed when no QR code is in view) */}
+          {isStreaming && (
+            <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-6 z-0">
               <div className="flex justify-between items-start">
-                <div className="w-9 h-9 border-t-4 border-l-4 border-cyan-400 rounded-tl-xl shadow-[0_0_10px_#22d3ee]" />
-                <span className="text-[10px] font-mono tracking-widest text-cyan-300 bg-slate-950/80 px-2 py-0.5 rounded border border-cyan-500/40">
-                  AR LIVE: AKTIF
+                <div className="w-8 h-8 border-t-4 border-l-4 border-cyan-400/80 rounded-tl-xl shadow-[0_0_8px_#22d3ee]" />
+                <span className="text-[10px] font-mono text-cyan-300 bg-slate-950/80 px-2 py-0.5 rounded border border-cyan-500/40">
+                  SCAN CONTINUOUS: LIVE
                 </span>
-                <div className="w-9 h-9 border-t-4 border-r-4 border-cyan-400 rounded-tr-xl shadow-[0_0_10px_#22d3ee]" />
+                <div className="w-8 h-8 border-t-4 border-r-4 border-cyan-400/80 rounded-tr-xl shadow-[0_0_8px_#22d3ee]" />
               </div>
 
-              {/* AR Center Reticle Target */}
-              <div className="relative flex items-center justify-center my-auto">
-                {/* Rotating Sci-Fi HUD Ring */}
-                <div className="w-44 h-44 rounded-full border border-dashed border-cyan-400/50 animate-ar-spin flex items-center justify-center" />
-                <div className="absolute w-36 h-36 rounded-full border border-cyan-400/30 animate-ar-spin-reverse" />
-                {/* Crosshairs */}
-                <div className="absolute w-5 h-0.5 bg-cyan-400/70" />
-                <div className="absolute h-5 w-0.5 bg-cyan-400/70" />
-                {/* Scanning Radar Line */}
-                <div className="absolute inset-x-4 h-0.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_15px_#22d3ee] animate-ar-radar" />
-              </div>
+              {/* Scanning Laser Beam */}
+              <div className="w-full h-0.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_12px_#22d3ee] animate-pulse" />
 
-              {/* AR Bottom Brackets */}
               <div className="flex justify-between items-end">
-                <div className="w-9 h-9 border-b-4 border-l-4 border-cyan-400 rounded-bl-xl shadow-[0_0_10px_#22d3ee]" />
-                <span className="text-[9px] font-mono text-cyan-400/80 bg-slate-950/70 px-2 py-0.5 rounded">
-                  Arahkan QR ke kotak pemindai
+                <div className="w-8 h-8 border-b-4 border-l-4 border-cyan-400/80 rounded-bl-xl shadow-[0_0_8px_#22d3ee]" />
+                <span className="text-[9px] font-mono text-cyan-400/90 bg-slate-950/70 px-2 py-0.5 rounded">
+                  Arahkan kamera ke QR barang apa saja
                 </span>
-                <div className="w-9 h-9 border-b-4 border-r-4 border-cyan-400 rounded-br-xl shadow-[0_0_10px_#22d3ee]" />
-              </div>
-            </div>
-          )}
-
-          {/* =========================================================================
-              AR LOCKED-ON MODE: COLOR TRANSFORMATION (HIJAU / KUNING / MERAH)
-             ========================================================================= */}
-          {scannedItem && calc && (
-            <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-4 z-20 transition-all duration-300">
-              {/* Floating Holographic AR Header Badge */}
-              <div className="flex justify-between items-start animate-in slide-in-from-top-4 duration-300">
-                {/* Top-Left AR Corner */}
-                <div
-                  className={`w-10 h-10 border-t-4 border-l-4 rounded-tl-xl transition-all ${
-                    calc.status === 'red'
-                      ? 'border-red-500 shadow-[0_0_15px_#ef4444]'
-                      : calc.status === 'yellow'
-                      ? 'border-amber-400 shadow-[0_0_15px_#f59e0b]'
-                      : 'border-emerald-400 shadow-[0_0_15px_#10b981]'
-                  }`}
-                />
-
-                {/* Floating AR Hologram Pill */}
-                <div
-                  className={`px-3 py-1 rounded-full text-xs font-black tracking-wide flex items-center gap-1.5 backdrop-blur-md shadow-2xl border ${
-                    calc.status === 'red'
-                      ? 'bg-red-600/90 text-white border-red-400 shadow-red-500/50 animate-pulse'
-                      : calc.status === 'yellow'
-                      ? 'bg-amber-500/90 text-slate-950 border-amber-300 shadow-amber-500/50'
-                      : 'bg-emerald-600/90 text-white border-emerald-300 shadow-emerald-500/50'
-                  }`}
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      calc.status === 'red'
-                        ? 'bg-white animate-ping'
-                        : calc.status === 'yellow'
-                        ? 'bg-slate-950 animate-pulse'
-                        : 'bg-white'
-                    }`}
-                  />
-                  <span>AR: {calc.badgeText}</span>
-                </div>
-
-                {/* Top-Right AR Corner */}
-                <div
-                  className={`w-10 h-10 border-t-4 border-r-4 rounded-tr-xl transition-all ${
-                    calc.status === 'red'
-                      ? 'border-red-500 shadow-[0_0_15px_#ef4444]'
-                      : calc.status === 'yellow'
-                      ? 'border-amber-400 shadow-[0_0_15px_#f59e0b]'
-                      : 'border-emerald-400 shadow-[0_0_15px_#10b981]'
-                  }`}
-                />
-              </div>
-
-              {/* Center AR Reticle Lock-On with Status Glow */}
-              <div className="relative flex items-center justify-center my-auto">
-                <div
-                  className={`w-48 h-48 rounded-2xl border-2 transition-all flex items-center justify-center backdrop-blur-[2px] ${
-                    calc.status === 'red'
-                      ? 'border-red-500 bg-red-500/10 shadow-[inset_0_0_20px_#ef4444,0_0_25px_#ef4444]'
-                      : calc.status === 'yellow'
-                      ? 'border-amber-400 bg-amber-400/10 shadow-[inset_0_0_20px_#f59e0b,0_0_25px_#f59e0b]'
-                      : 'border-emerald-400 bg-emerald-400/10 shadow-[inset_0_0_20px_#10b981,0_0_25px_#10b981]'
-                  }`}
-                >
-                  {/* Rotating Inner AR Ring */}
-                  <div
-                    className={`w-40 h-40 rounded-full border border-dashed animate-ar-spin-fast ${
-                      calc.status === 'red'
-                        ? 'border-red-400/70'
-                        : calc.status === 'yellow'
-                        ? 'border-amber-400/70'
-                        : 'border-emerald-400/70'
-                    }`}
-                  />
-
-                  {/* Center Lock Reticle Icon */}
-                  <div className="absolute text-center">
-                    <span
-                      className={`text-xs font-mono font-black uppercase px-2 py-0.5 rounded-md shadow-md ${
-                        calc.status === 'red'
-                          ? 'bg-red-600 text-white'
-                          : calc.status === 'yellow'
-                          ? 'bg-amber-400 text-slate-950 font-extrabold'
-                          : 'bg-emerald-600 text-white'
-                      }`}
-                    >
-                      {calc.status === 'red'
-                        ? '🔴 EXP HARI INI'
-                        : calc.status === 'yellow'
-                        ? '🟡 PERTENGAHAN'
-                        : '🟢 AMAN (SEGAR)'}
-                    </span>
-                    <span className="block text-[10px] font-mono font-bold text-white drop-shadow mt-1">
-                      {calc.daysRemaining > 0
-                        ? `Sisa ${calc.daysRemaining} Hari`
-                        : calc.daysRemaining === 0
-                        ? 'Hari Ini Terakhir!'
-                        : `Lewat ${Math.abs(calc.daysRemaining)} Hari`}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Bottom AR Corners with Target Info */}
-              <div className="flex justify-between items-end animate-in slide-in-from-bottom-4 duration-300">
-                <div
-                  className={`w-10 h-10 border-b-4 border-l-4 rounded-bl-xl transition-all ${
-                    calc.status === 'red'
-                      ? 'border-red-500 shadow-[0_0_15px_#ef4444]'
-                      : calc.status === 'yellow'
-                      ? 'border-amber-400 shadow-[0_0_15px_#f59e0b]'
-                      : 'border-emerald-400 shadow-[0_0_15px_#10b981]'
-                  }`}
-                />
-
-                {/* Floating AR Holographic Product Tag */}
-                <div className="bg-slate-950/90 border border-slate-700/80 px-3 py-1.5 rounded-xl shadow-xl text-center max-w-[210px] pointer-events-auto">
-                  <span className="text-[10px] font-bold text-white line-clamp-1 block">
-                    {scannedItem.name || 'Produk Terdeteksi'}
-                  </span>
-                  <span className="text-[9px] font-mono text-slate-300">
-                    EXP: {scannedItem.expDate}
-                  </span>
-                </div>
-
-                <div
-                  className={`w-10 h-10 border-b-4 border-r-4 rounded-br-xl transition-all ${
-                    calc.status === 'red'
-                      ? 'border-red-500 shadow-[0_0_15px_#ef4444]'
-                      : calc.status === 'yellow'
-                      ? 'border-amber-400 shadow-[0_0_15px_#f59e0b]'
-                      : 'border-emerald-400 shadow-[0_0_15px_#10b981]'
-                  }`}
-                />
+                <div className="w-8 h-8 border-b-4 border-r-4 border-cyan-400/80 rounded-br-xl shadow-[0_0_8px_#22d3ee]" />
               </div>
             </div>
           )}
@@ -759,24 +781,14 @@ export const QRScanner: React.FC<QRScannerProps> = ({
                   <Camera className="w-4 h-4" />
                   <span>Aktifkan Kamera Sekarang</span>
                 </button>
-
-                {cameraError && (
-                  <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800 text-[11px] text-slate-400 text-left space-y-1">
-                    <span className="font-semibold text-cyan-400 flex items-center gap-1">
-                      <HelpCircle className="w-3.5 h-3.5" />
-                      <span>Tips jika kamera tidak muncul:</span>
-                    </span>
-                    <p>• Ketuk ikon gembok / izin situs di bilah browser HP dan izinkan "Camera".</p>
-                    <p>• Atau gunakan tombol "Unggah Foto QR" di bawah.</p>
-                  </div>
-                )}
               </div>
             </div>
           )}
         </div>
 
         {/* =========================================================================
-            FEATURE 2: TOMBOL KURANGI STOK (-1) & KONTROL STOK REAL-TIME
+            PANEL KONTROL STOK REAL-TIME & TOMBOL 1X KLIK KURANGI STOK (-1)
+            Updates dynamically to whatever item is currently in view!
            ========================================================================= */}
         {scannedItem && (
           <div className="mt-3.5 p-4 rounded-2xl bg-slate-950 border border-slate-800 shadow-xl space-y-3 animate-in fade-in zoom-in-95 duration-200">
@@ -795,9 +807,13 @@ export const QRScanner: React.FC<QRScannerProps> = ({
             <div className="flex items-center justify-between bg-slate-900/90 p-3 rounded-xl border border-slate-800">
               <div>
                 <span className="text-[10px] uppercase font-bold text-slate-400 block tracking-wider">
-                  Sisa Stok Real-time (Firebase):
+                  Barang Terpindai:
                 </span>
-                <div className="flex items-baseline gap-1.5 mt-0.5">
+                <h4 className="text-sm font-bold text-white line-clamp-1">
+                  {scannedItem.name || 'Barang Terpindai'}
+                </h4>
+                <div className="flex items-baseline gap-1.5 mt-1">
+                  <span className="text-[11px] text-slate-400">Sisa Stok:</span>
                   <span
                     className={`text-2xl font-black font-mono transition-transform ${
                       currentStock <= 0
@@ -841,8 +857,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               )}
             </div>
 
-            {/* THE PRIMARY 1-TAP ACTION BUTTON REQUESTED BY USER:
-                "tombol yang jika di tekan 1x maka stock akan berkurang 1" */}
+            {/* TOMBOL 1X TEKAN: KURANGI STOK (-1) */}
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -866,21 +881,17 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               </button>
             </div>
 
-            {/* Quick Actions Bar */}
+            {/* Toggle Detailed View */}
             <div className="flex items-center justify-between pt-1 text-xs">
-              <button
-                type="button"
-                onClick={resumeScanning}
-                className="flex items-center gap-1.5 py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 font-semibold border border-slate-700 active:scale-95 transition-all"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Pindai Barang Berikutnya</span>
-              </button>
+              <span className="text-[11px] text-emerald-400 flex items-center gap-1 font-medium">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                <span>Kamera Live siap membaca QR berikutnya</span>
+              </span>
 
               <button
                 type="button"
                 onClick={() => setViewDetails(!viewDetails)}
-                className="flex items-center gap-1 py-2 px-3 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 font-medium border border-slate-700"
+                className="flex items-center gap-1 py-1.5 px-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 font-medium border border-slate-700"
               >
                 <span>{viewDetails ? 'Sembunyikan' : 'Rincian'}</span>
                 {viewDetails ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
@@ -991,12 +1002,12 @@ export const QRScanner: React.FC<QRScannerProps> = ({
           </label>
         </div>
 
-        {/* Quick Demo Test Buttons */}
+        {/* Quick Demo Test Buttons for Live AR Color Switching */}
         <div className="mt-3.5 pt-3 border-t border-slate-800/80">
           <div className="flex items-center justify-between mb-2">
             <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1">
               <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-              <span>Simulasi Uji Coba AR & Tombol -1 Stok:</span>
+              <span>Uji Coba Ganti Warna AR Secara Instan (1-Klik):</span>
             </span>
           </div>
           <div className="grid grid-cols-3 gap-2">
@@ -1004,7 +1015,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               onClick={() => handleQuickTest('green')}
               className="py-2 px-1 rounded-xl bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-700/60 text-xs font-bold flex flex-col items-center gap-0.5 active:scale-95 transition-all"
             >
-              <span className="text-[10px]">🟢 AR HIJAU</span>
+              <span className="text-[10px]">🟢 GANTI HIJAU</span>
               <span className="text-[9px] font-normal text-emerald-400/80">Di Atas EXP</span>
             </button>
 
@@ -1012,7 +1023,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               onClick={() => handleQuickTest('yellow')}
               className="py-2 px-1 rounded-xl bg-amber-950/60 hover:bg-amber-900/60 text-amber-300 border border-amber-700/60 text-xs font-bold flex flex-col items-center gap-0.5 active:scale-95 transition-all"
             >
-              <span className="text-[10px]">🟡 AR KUNING</span>
+              <span className="text-[10px]">🟡 GANTI KUNING</span>
               <span className="text-[9px] font-normal text-amber-400/80">Pertengahan</span>
             </button>
 
@@ -1020,7 +1031,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               onClick={() => handleQuickTest('red')}
               className="py-2 px-1 rounded-xl bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-700/60 text-xs font-bold flex flex-col items-center gap-0.5 active:scale-95 transition-all"
             >
-              <span className="text-[10px]">🔴 AR MERAH</span>
+              <span className="text-[10px]">🔴 GANTI MERAH</span>
               <span className="text-[9px] font-normal text-red-400/80">Hari EXP</span>
             </button>
           </div>
